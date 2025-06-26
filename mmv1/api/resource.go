@@ -734,6 +734,7 @@ func buildWriteOnlyField(name string, parent *Type, originalField *Type) *Type {
 		propertyWithRequired(false),
 		propertyWithDescription(description),
 		propertyWithWriteOnly(true),
+		propertyWithApiName(originalField.ApiName),
 		propertyWithIgnoreRead(true),
 		propertyWithConflicts([]string{conflictsWith}),
 	}
