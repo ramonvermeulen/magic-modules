@@ -6,6 +6,7 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-provider-google/google/acctest"
+	"github.com/hashicorp/terraform-provider-google/google/envvar"
 )
 
 func TestAccVertexAIEndpoint_vertexAiEndpointNetwork(t *testing.T) {
@@ -123,5 +124,130 @@ resource "google_kms_crypto_key_iam_member" "crypto_key" {
 }
 
 data "google_project" "project" {}
+`, context)
+}
+
+func TestAccVertexAIEndpoint_vertexAiEndpointPrivateServiceConnectExample(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix":   acctest.RandString(t, 10),
+		"org_id":          envvar.GetTestOrgFromEnv(t),
+		"billing_account": envvar.GetTestBillingAccountFromEnv(t),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		CheckDestroy:             testAccCheckVertexAIEndpointDestroyProducer(t),
+		ExternalProviders: map[string]resource.ExternalProvider{
+			"time": {},
+		},
+		Steps: []resource.TestStep{
+			{
+				Config: testAccVertexAIEndpoint_vertexAiEndpointPrivateServiceConnect_basic(context),
+			},
+			{
+				ResourceName:            "google_vertex_ai_endpoint.endpoint",
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"etag", "labels", "location", "name", "region", "terraform_labels"},
+			},
+			{
+				Config: testAccVertexAIEndpoint_vertexAiEndpointPrivateServiceConnect_update(context),
+			},
+			{
+				ResourceName:            "google_vertex_ai_endpoint.endpoint",
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"etag", "labels", "location", "name", "region", "terraform_labels"},
+			},
+		},
+	})
+}
+
+func testAccVertexAIEndpoint_vertexAiEndpointPrivateServiceConnect_basic(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "default" {
+  name = "network-%{random_suffix}"
+}
+
+resource "google_vertex_ai_endpoint" "endpoint" {
+  name         = "endpoint-name%{random_suffix}"
+  display_name = "sample-endpoint"
+  description  = "A sample vertex endpoint"
+  location     = "us-central1"
+  region       = "us-central1"
+  labels       = {
+    label-one = "value-one"
+  }
+  private_service_connect_config {
+    enable_private_service_connect = true
+    project_allowlist = [
+      "${data.google_project.project.project_id}"
+    ]
+
+    psc_automation_configs {
+      project_id = data.google_project.project.project_id
+      network    = google_compute_network.default.id
+    }
+  }
+}
+
+data "google_project" "project" {}
+`, context)
+}
+
+func testAccVertexAIEndpoint_vertexAiEndpointPrivateServiceConnect_update(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_project" "basic" {
+  project_id      = "tf-test-id%{random_suffix}"
+  name            = "tf-test-id%{random_suffix}"
+  org_id          = "%{org_id}"
+  deletion_policy = "DELETE"
+  billing_account = "%{billing_account}"
+}
+
+resource "time_sleep" "wait_2_mins" {
+  create_duration = "120s"
+
+  depends_on = [google_project.basic]
+}
+
+resource "google_project_service" "basic" {
+  project = google_project.basic.project_id
+  service = "compute.googleapis.com"
+	
+	depends_on = [time_sleep.wait_2_mins]
+}
+
+resource "google_compute_network" "default" {
+	project = google_project.basic.project_id
+  name    = "network-%{random_suffix}"
+	
+	depends_on = [google_project_service.basic]
+}
+
+resource "google_vertex_ai_endpoint" "endpoint" {
+  name         = "endpoint-name%{random_suffix}"
+  display_name = "sample-endpoint"
+  description  = "A sample vertex endpoint"
+  location     = "us-central1"
+  region       = "us-central1"
+  labels       = {
+    label-one = "value-one"
+  }
+  private_service_connect_config {
+    enable_private_service_connect = true
+    project_allowlist = [
+      "${google_project.basic.project_id}"
+    ]
+
+    psc_automation_configs {
+      project_id = google_project.basic.project_id
+      network    = google_compute_network.default.id
+    }
+  }
+}
 `, context)
 }
