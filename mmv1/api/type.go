@@ -121,18 +121,18 @@ type Type struct {
 
 	ExactVersion string `yaml:"exact_version,omitempty"`
 
-	// A list of properties that conflict with this property. Uses the "lineage"
+	// A pointer to a list of properties that conflict with this property. Uses the "lineage"
 	// field to identify the property eg: parent.meta.label.foo
-	Conflicts []string `yaml:"conflicts,omitempty"`
+	Conflicts *[]string `yaml:"conflicts,omitempty"`
 
-	// A list of properties that at least one of must be set.
-	AtLeastOneOf []string `yaml:"at_least_one_of,omitempty"`
+	// A pointer to a list of properties that at least one of must be set.
+	AtLeastOneOf *[]string `yaml:"at_least_one_of,omitempty"`
 
-	// A list of properties that exactly one of must be set.
-	ExactlyOneOf []string `yaml:"exactly_one_of,omitempty"`
+	// A pointer to a list of properties that exactly one of must be set.
+	ExactlyOneOf *[]string `yaml:"exactly_one_of,omitempty"`
 
-	// A list of properties that are required to be set together.
-	RequiredWith []string `yaml:"required_with,omitempty"`
+	// A pointer to a list of properties that are required to be set together.
+	RequiredWith *[]string `yaml:"required_with,omitempty"`
 
 	// Can only be overridden - we should never set this ourselves.
 	NewType string `yaml:"-"`
@@ -623,11 +623,11 @@ func (t Type) FWResourceType() string {
 // Returns list of properties that are in conflict with this property.
 // func (t *Type) conflicting() {
 func (t Type) Conflicting() []string {
-	if t.ResourceMetadata == nil {
+	if t.ResourceMetadata == nil || t.Conflicts == nil {
 		return []string{}
 	}
 
-	return t.Conflicts
+	return *t.Conflicts
 }
 
 // TODO rewrite: validation
@@ -643,11 +643,11 @@ func (t Type) Conflicting() []string {
 // Returns list of properties that needs at least one of their fields set.
 // func (t *Type) at_least_one_of_list() {
 func (t Type) AtLeastOneOfList() []string {
-	if t.ResourceMetadata == nil {
+	if t.ResourceMetadata == nil || t.AtLeastOneOf == nil {
 		return []string{}
 	}
 
-	return t.AtLeastOneOf
+	return *t.AtLeastOneOf
 }
 
 // TODO rewrite: validation
@@ -663,11 +663,11 @@ func (t Type) AtLeastOneOfList() []string {
 // Returns list of properties that needs exactly one of their fields set.
 // func (t *Type) exactly_one_of_list() {
 func (t Type) ExactlyOneOfList() []string {
-	if t.ResourceMetadata == nil {
+	if t.ResourceMetadata == nil || t.ExactlyOneOf == nil {
 		return []string{}
 	}
 
-	return t.ExactlyOneOf
+	return *t.ExactlyOneOf
 }
 
 // TODO rewrite: validation
@@ -682,11 +682,11 @@ func (t Type) ExactlyOneOfList() []string {
 
 // Returns list of properties that needs required with their fields set.
 func (t Type) RequiredWithList() []string {
-	if t.ResourceMetadata == nil {
+	if t.ResourceMetadata == nil || t.RequiredWith == nil {
 		return []string{}
 	}
 
-	return t.RequiredWith
+	return *t.RequiredWith
 }
 
 func (t Type) Parent() *Type {
@@ -1113,25 +1113,25 @@ func propertyWithIgnoreRead(ignoreRead bool) func(*Type) {
 	}
 }
 
-func propertyWithConflicts(conflicts []string) func(*Type) {
+func propertyWithConflicts(conflicts *[]string) func(*Type) {
 	return func(p *Type) {
 		p.Conflicts = conflicts
 	}
 }
 
-func propertyWithRequiredWith(requiredWith []string) func(*Type) {
+func propertyWithRequiredWith(requiredWith *[]string) func(*Type) {
 	return func(p *Type) {
 		p.RequiredWith = requiredWith
 	}
 }
 
-func propertyWithExactlyOneOf(exactlyOneOf []string) func(*Type) {
+func propertyWithExactlyOneOf(exactlyOneOf *[]string) func(*Type) {
 	return func(p *Type) {
 		p.ExactlyOneOf = exactlyOneOf
 	}
 }
 
-func propertyWithAtLeastOneOf(atLeastOneOf []string) func(*Type) {
+func propertyWithAtLeastOneOf(atLeastOneOf *[]string) func(*Type) {
 	return func(p *Type) {
 		p.AtLeastOneOf = atLeastOneOf
 	}

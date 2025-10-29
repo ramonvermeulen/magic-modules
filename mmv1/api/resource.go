@@ -336,6 +336,9 @@ type Resource struct {
 
 	ProductMetadata *Product `yaml:"-"`
 
+	// TODO(ramon): ConstraintGroupRegistry is used to store ...
+	ConstraintGroupRegistry *ConstraintGroupRegistry `yaml:"-"`
+
 	// The version name provided by the user through CI
 	TargetVersionName string `yaml:"-"`
 
@@ -447,9 +450,11 @@ func (r *Resource) SetDefault(product *Product) {
 
 	r.ProductMetadata = product
 	for _, property := range r.AllProperties() {
+		r.RegisterFieldConstraints(property)
 		property.SetDefault(r)
 	}
 	for _, vf := range r.VirtualFields {
+		r.RegisterFieldConstraints(vf)
 		vf.SetDefault(r)
 	}
 	if r.IamPolicy != nil && r.IamPolicy.MinVersion == "" {
@@ -755,6 +760,67 @@ func (r Resource) GetIdentity() []*Type {
 	})
 }
 
+func (r *Resource) GetConstraintGroupRegistry() *ConstraintGroupRegistry {
+	if r.ConstraintGroupRegistry == nil {
+		r.ConstraintGroupRegistry = NewConstraintGroupRegistry()
+	}
+	return r.ConstraintGroupRegistry
+}
+
+func (r *Resource) AddWriteOnlyFieldToConstraints(originalField *Type, writeOnlyFieldPath string, writeOnlyVersionFieldPath string, constraintTypes ...ConstraintGroupType) {
+	fmt.Printf("[RAMON] Adding write-only field '%s' and version field '%s' to constraints of field '%s'\n", writeOnlyFieldPath, writeOnlyVersionFieldPath, originalField.Name)
+	fmt.Printf("[RAMON] constraintTypes: %v\n", constraintTypes)
+	registry := r.GetConstraintGroupRegistry()
+	newMembers := []string{writeOnlyFieldPath, writeOnlyVersionFieldPath}
+
+	for _, constraintType := range constraintTypes {
+		var originalConstraints *[]string
+
+		switch constraintType {
+		case GroupExactlyOneOf:
+			originalConstraints = originalField.ExactlyOneOf
+		case GroupAtLeastOneOf:
+			originalConstraints = originalField.AtLeastOneOf
+		case GroupRequiredWith:
+			originalConstraints = originalField.RequiredWith
+		case GroupConflictsWith:
+			originalConstraints = originalField.Conflicts
+		}
+
+		if originalConstraints != nil && len(*originalConstraints) > 0 {
+			registry.AddMembersToGroup(constraintType, *originalConstraints, newMembers)
+		}
+	}
+}
+
+func (r *Resource) RegisterFieldConstraints(field *Type) {
+	registry := r.GetConstraintGroupRegistry()
+
+	registerConstraintGroup := func(groupType ConstraintGroupType, constraints *[]string) *[]string {
+		if constraints == nil || len(*constraints) == 0 {
+			return nil
+		}
+		group := registry.GetOrCreateGroup(groupType, *constraints)
+		return group.Members
+	}
+
+	if sharedGroup := registerConstraintGroup(GroupExactlyOneOf, field.ExactlyOneOf); sharedGroup != nil {
+		field.ExactlyOneOf = sharedGroup
+	}
+
+	if sharedGroup := registerConstraintGroup(GroupAtLeastOneOf, field.AtLeastOneOf); sharedGroup != nil {
+		field.AtLeastOneOf = sharedGroup
+	}
+
+	if sharedGroup := registerConstraintGroup(GroupRequiredWith, field.RequiredWith); sharedGroup != nil {
+		field.RequiredWith = sharedGroup
+	}
+
+	if sharedGroup := registerConstraintGroup(GroupConflictsWith, field.Conflicts); sharedGroup != nil {
+		field.Conflicts = sharedGroup
+	}
+}
+
 func deduplicateSliceOfStrings(slice []string) []string {
 	seen := make(map[string]bool, len(slice))
 	result := make([]string, 0, len(slice))
@@ -769,7 +835,7 @@ func deduplicateSliceOfStrings(slice []string) []string {
 	return result
 }
 
-func buildWriteOnlyField(name string, versionFieldName string, originalField *Type) *Type {
+func buildWriteOnlyField(name string, versionFieldName string, originalField *Type, resource *Resource) *Type {
 	description := fmt.Sprintf("%s Note: This property is write-only and will not be read from the API. For more info see [updating write-only attributes](/docs/providers/google/guides/using_write_only_attributes.html#updating-write-only-attributes)", originalField.Description)
 	originalFieldLineage := originalField.TerraformLineage()
 	fieldPathCurrentField := strings.ReplaceAll(originalFieldLineage, google.Underscore(originalField.Name), google.Underscore(name))
@@ -787,22 +853,34 @@ func buildWriteOnlyField(name string, versionFieldName string, originalField *Ty
 		propertyWithWriteOnly(true),
 		propertyWithApiName(apiName),
 		propertyWithIgnoreRead(true),
-		propertyWithRequiredWith([]string{requiredWith}),
+		propertyWithRequiredWith(&[]string{requiredWith}),
 	}
 
-	if originalField.Required {
+	if originalField.Required || originalField.ExactlyOneOf != nil && len(*originalField.ExactlyOneOf) > 0 {
 		originalField.Required = false
-		exactlyOneOf := append(originalField.ExactlyOneOf, originalFieldLineage, fieldPathCurrentField)
-		options = append(options, propertyWithExactlyOneOf(deduplicateSliceOfStrings(exactlyOneOf)))
-		originalField.ExactlyOneOf = deduplicateSliceOfStrings(exactlyOneOf)
+
+		if originalField.ExactlyOneOf != nil && len(*originalField.ExactlyOneOf) > 0 {
+			resource.AddWriteOnlyFieldToConstraints(originalField, originalFieldLineage, fieldPathCurrentField, GroupExactlyOneOf)
+		} else {
+			exactlyOneOf := []string{originalFieldLineage, fieldPathCurrentField}
+			registry := resource.GetConstraintGroupRegistry()
+			group := registry.GetOrCreateGroup(GroupExactlyOneOf, exactlyOneOf)
+			options = append(options, propertyWithExactlyOneOf(group.Members))
+			originalField.ExactlyOneOf = group.Members
+		}
 	} else {
-		conflicts := append(originalField.Conflicts, originalFieldLineage)
-		options = append(options, propertyWithConflicts(deduplicateSliceOfStrings(conflicts)))
+		var conflicts []string
+		if originalField.Conflicts != nil {
+			conflicts = append(*originalField.Conflicts, originalFieldLineage)
+		} else {
+			conflicts = []string{originalFieldLineage}
+		}
+		deduped := deduplicateSliceOfStrings(conflicts)
+		options = append(options, propertyWithConflicts(&deduped))
 	}
 
-	if len(originalField.AtLeastOneOf) > 0 {
-		atLeastOneOf := append(originalField.AtLeastOneOf, originalFieldLineage, fieldPathCurrentField)
-		options = append(options, propertyWithAtLeastOneOf(deduplicateSliceOfStrings(atLeastOneOf)))
+	if originalField.AtLeastOneOf != nil && len(*originalField.AtLeastOneOf) > 0 && originalField.Required {
+		resource.AddWriteOnlyFieldToConstraints(originalField, originalFieldLineage, fieldPathCurrentField, GroupAtLeastOneOf)
 	}
 
 	return NewProperty(name, originalField.ApiName, options)
@@ -816,7 +894,7 @@ func buildWriteOnlyVersionField(name string, originalField *Type, writeOnlyField
 		propertyWithType("Int"),
 		propertyWithImmutable(originalField.IsForceNew()),
 		propertyWithDescription(description),
-		propertyWithRequiredWith([]string{requiredWith}),
+		propertyWithRequiredWith(&[]string{requiredWith}),
 		propertyWithClientSide(true),
 	}
 
@@ -826,12 +904,12 @@ func buildWriteOnlyVersionField(name string, originalField *Type, writeOnlyField
 func (r *Resource) addWriteOnlyFields(props []*Type, propWithWoConfigured *Type) []*Type {
 	propWithWoConfigured.WriteOnly = false
 	propWithWoConfigured.Sensitive = true
-	if len(propWithWoConfigured.RequiredWith) > 0 {
+	if propWithWoConfigured.RequiredWith != nil && len(*propWithWoConfigured.RequiredWith) > 0 {
 		log.Fatalf("WriteOnly property '%s' in resource '%s' cannot have RequiredWith set. This combination is not supported.", propWithWoConfigured.Name, r.Name)
 	}
 	woFieldName := fmt.Sprintf("%sWo", propWithWoConfigured.Name)
 	woVersionFieldName := fmt.Sprintf("%sVersion", woFieldName)
-	writeOnlyField := buildWriteOnlyField(woFieldName, woVersionFieldName, propWithWoConfigured)
+	writeOnlyField := buildWriteOnlyField(woFieldName, woVersionFieldName, propWithWoConfigured, r) // Pass resource here
 	writeOnlyVersionField := buildWriteOnlyVersionField(woVersionFieldName, propWithWoConfigured, writeOnlyField)
 	props = append(props, writeOnlyField, writeOnlyVersionField)
 	return props
