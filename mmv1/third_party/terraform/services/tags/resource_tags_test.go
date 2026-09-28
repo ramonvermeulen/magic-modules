@@ -1,7 +1,11 @@
 package tags_test
 
 import (
+	"context"
 	"fmt"
+	"io"
+	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -104,6 +108,18 @@ func testAccTagsTagKey_tagKeyBasicWithPurposeGceFirewall(t *testing.T) {
 			{
 				Config: testAccTagsTagKey_tagKeyBasicWithPurposeGceFirewallExample(context),
 			},
+			// Regression test for https://github.com/hashicorp/terraform-provider-google/issues/20073:
+			// purpose_data was ignore_read, so importing left it empty and the (immutable) field
+			// forced a replacement on the next plan.
+			{
+				ResourceName:      "google_tags_tag_key.key",
+				ImportState:       true,
+				ImportStateVerify: true,
+				// The API returns the parent as projects/{projectNumber} while the config uses
+				// projects/{projectId}; ProjectNumberDiffSuppress handles the plan diff, but the
+				// import verifier compares the raw config and refreshed state.
+				ImportStateVerifyIgnore: []string{"parent"},
+			},
 		},
 	})
 }
@@ -120,9 +136,11 @@ resource "google_tags_tag_key" "key" {
 	  short_name = "tf-test-foo%{random_suffix}"
 	  description = "For foo%{random_suffix} resources."
 	  purpose = "GCE_FIREWALL"
-	  # purpose_data expects either a selfLinkWithId (not a property of google_compute_network) or the format <project-name>/<vpc-name>.
-	  # selfLink is not sufficient and will result in an error, so we build a string to match the second option.
-	  purpose_data = {network = "${google_compute_network.tag_network.project}/${google_compute_network.tag_network.name}"}
+	  # purpose_data.network must be a Compute network self link containing the numeric network id,
+	  # matching the form the API returns (and that the provider stores in state), to avoid a diff
+	  # on the immutable purpose_data field. google_compute_network.self_link is "{version}/projects/
+	  # {project}/global/networks/{network_name}", so build the id-bearing self link from its parts.
+	  purpose_data = { network = "https://www.googleapis.com/compute/v1/projects/${google_compute_network.tag_network.project}/global/networks/${google_compute_network.tag_network.id}" }
 	}
 
 `, context)
@@ -1651,4 +1669,127 @@ func testAccCheckTagsLocationTagBindingDestroyProducer(t *testing.T) func(s *ter
 		}
 		return nil
 	}
+}
+
+func TestTagsTagKeyStateUpgradeV0(t *testing.T) {
+	// Cases where the upgrader must leave purpose_data exactly as it found it. None of these need a
+	// network lookup, so they run with a nil meta.
+	unchangedCases := map[string]map[string]interface{}{
+		"self link is left untouched": {
+			"network": "https://www.googleapis.com/compute/v1/projects/my-project/global/networks/123456789",
+		},
+		"self link on a non-v1 compute version is left untouched": {
+			"network": "https://www.googleapis.com/compute/staging_v1/projects/my-project/global/networks/123456789",
+		},
+		"nil purpose data is left untouched": nil,
+		"purpose data without a network key is left untouched": {
+			"organization": "auto",
+		},
+		// A malformed short form cannot be resolved, so the value is left alone rather than failing
+		// the upgrade and blocking every subsequent plan on the resource.
+		"empty project is left untouched": {
+			"network": "/vpc-us-west1",
+		},
+		"empty network name is left untouched": {
+			"network": "my-project/",
+		},
+	}
+
+	for name, purposeData := range unchangedCases {
+		t.Run(name, func(t *testing.T) {
+			rawState := map[string]interface{}{"purpose_data": purposeData}
+
+			actual, err := tags.ResourceTagsTagKeyUpgradeV0(context.Background(), rawState, nil)
+			if err != nil {
+				t.Fatalf("upgrade must never fail, got: %s", err)
+			}
+			if !reflect.DeepEqual(actual["purpose_data"], purposeData) {
+				t.Fatalf("\n\nexpected:\n\n%#v\n\ngot:\n\n%#v\n\n", purposeData, actual["purpose_data"])
+			}
+		})
+	}
+
+	// The short form cannot be resolved without asking Compute for the network, so these need a
+	// stubbed client. They assert the full upgrade: the lookup that is issued, the self link that
+	// ends up in state, and that a failed lookup degrades gracefully.
+	t.Run("short form is converted to the self link", func(t *testing.T) {
+		var requestedPath string
+		rawState := map[string]interface{}{
+			"purpose_data": map[string]interface{}{
+				"network": "my-project/vpc-us-west1",
+			},
+		}
+
+		actual, err := tags.ResourceTagsTagKeyUpgradeV0(
+			context.Background(),
+			rawState,
+			&transport_tpg.Config{Client: networkLookupClient(t, http.StatusOK, func(path string) { requestedPath = path })},
+		)
+		if err != nil {
+			t.Fatalf("error migrating state: %s", err)
+		}
+
+		const wantNetwork = "https://www.googleapis.com/compute/v1/projects/my-project/global/networks/123456789"
+		purposeData := actual["purpose_data"].(map[string]interface{})
+		if purposeData["network"] != wantNetwork {
+			t.Errorf("network: want %q, got %v", wantNetwork, purposeData["network"])
+		}
+
+		// The project and network name from the short form must be the ones looked up.
+		const wantPath = "/compute/v1/projects/my-project/global/networks/vpc-us-west1"
+		if requestedPath != wantPath {
+			t.Errorf("lookup path: want %q, got %q", wantPath, requestedPath)
+		}
+	})
+
+	t.Run("failed lookup leaves the short form untouched", func(t *testing.T) {
+		const shortForm = "my-project/vpc-us-west1"
+		rawState := map[string]interface{}{
+			"purpose_data": map[string]interface{}{"network": shortForm},
+		}
+
+		actual, err := tags.ResourceTagsTagKeyUpgradeV0(
+			context.Background(),
+			rawState,
+			&transport_tpg.Config{Client: networkLookupClient(t, http.StatusNotFound, nil)},
+		)
+		if err != nil {
+			t.Fatalf("a failed lookup must not fail the upgrade, got: %s", err)
+		}
+		if got := actual["purpose_data"].(map[string]interface{})["network"]; got != shortForm {
+			t.Errorf("network: want %q to be left unchanged, got %v", shortForm, got)
+		}
+	})
+}
+
+// networkLookupClient returns an http.Client that answers the Compute networks GET issued by the
+// upgrader, so the short-form path can be tested without binding a local port. A non-200 status
+// makes the request fail, exercising the graceful-degradation path.
+func networkLookupClient(t *testing.T, status int, onRequest func(path string)) *http.Client {
+	t.Helper()
+	return &http.Client{
+		Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			if onRequest != nil {
+				onRequest(r.URL.Path)
+			}
+			body := `{"selfLink": "https://www.googleapis.com/compute/v1/projects/my-project/global/networks/123456789"}`
+			if status != http.StatusOK {
+				body = `{"error": {"code": 404, "message": "not found"}}`
+			}
+			return &http.Response{
+				StatusCode: status,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Request:    r,
+			}, nil
+		}),
+	}
+}
+
+// roundTripperFunc adapts a function into an http.RoundTripper so the short-form upgrade path can be
+// exercised without binding a local port.
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
 }
