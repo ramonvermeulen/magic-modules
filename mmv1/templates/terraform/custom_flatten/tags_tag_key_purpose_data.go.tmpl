@@ -18,13 +18,8 @@ func flatten{{$.GetPrefix}}{{$.TitlelizeProperty}}(v interface{}, d *schema.Reso
 	if len(original) == 0 {
 		return nil
 	}
-	transformed := make(map[string]interface{})
-	for k, val := range original {
-		transformed[k] = val
-	}
 	// `network` is returned by the API in its canonical self-link-with-id form
 	// (https://www.googleapis.com/compute/{compute_version}/projects/{projectId}/global/networks/{networkId}).
-	// Store that value verbatim rather than the user's original short form so that reads are
-	// idempotent; legacy states in the short form are converted by the resource's state upgrader.
-	return transformed
+	// That is also the form the expander sends, so the value is stored verbatim and reads are idempotent.
+	return original
 }

@@ -1,11 +1,9 @@
 package tags_test
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"net/http"
-	"reflect"
 	"strings"
 	"testing"
 
@@ -17,6 +15,7 @@ import (
 	"github.com/hashicorp/terraform-provider-google/google/services/tags"
 	"github.com/hashicorp/terraform-provider-google/google/services/tagslocation"
 
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
 	"github.com/hashicorp/terraform-provider-google/google/tpgresource"
@@ -1671,68 +1670,45 @@ func testAccCheckTagsLocationTagBindingDestroyProducer(t *testing.T) func(s *ter
 	}
 }
 
-func TestTagsTagKeyStateUpgradeV0(t *testing.T) {
-	// Cases where the upgrader must leave purpose_data exactly as it found it. None of these need a
-	// network lookup, so they run with a nil meta.
-	unchangedCases := map[string]map[string]interface{}{
-		"self link is left untouched": {
-			"network": "https://www.googleapis.com/compute/v1/projects/my-project/global/networks/123456789",
-		},
-		"self link on a non-v1 compute version is left untouched": {
-			"network": "https://www.googleapis.com/compute/staging_v1/projects/my-project/global/networks/123456789",
-		},
-		"nil purpose data is left untouched": nil,
-		"purpose data without a network key is left untouched": {
-			"organization": "auto",
-		},
-		// A malformed short form cannot be resolved, so the value is left alone rather than failing
-		// the upgrade and blocking every subsequent plan on the resource.
-		"empty project is left untouched": {
-			"network": "/vpc-us-west1",
-		},
-		"empty network name is left untouched": {
-			"network": "my-project/",
-		},
-	}
+func TestTagsTagKeyPurposeDataExpand(t *testing.T) {
+	const selfLink = "https://www.googleapis.com/compute/v1/projects/my-project/global/networks/123456789"
 
-	for name, purposeData := range unchangedCases {
-		t.Run(name, func(t *testing.T) {
-			rawState := map[string]interface{}{"purpose_data": purposeData}
-
-			actual, err := tags.ResourceTagsTagKeyUpgradeV0(context.Background(), rawState, nil)
-			if err != nil {
-				t.Fatalf("upgrade must never fail, got: %s", err)
-			}
-			if !reflect.DeepEqual(actual["purpose_data"], purposeData) {
-				t.Fatalf("\n\nexpected:\n\n%#v\n\ngot:\n\n%#v\n\n", purposeData, actual["purpose_data"])
-			}
-		})
-	}
-
-	// The short form cannot be resolved without asking Compute for the network, so these need a
-	// stubbed client. They assert the full upgrade: the lookup that is issued, the self link that
-	// ends up in state, and that a failed lookup degrades gracefully.
-	t.Run("short form is converted to the self link", func(t *testing.T) {
-		var requestedPath string
-		rawState := map[string]interface{}{
-			"purpose_data": map[string]interface{}{
-				"network": "my-project/vpc-us-west1",
-			},
-		}
-
-		actual, err := tags.ResourceTagsTagKeyUpgradeV0(
-			context.Background(),
-			rawState,
-			&transport_tpg.Config{Client: networkLookupClient(t, http.StatusOK, func(path string) { requestedPath = path })},
-		)
+	// Cases that need no API call: already a self link, or another key entirely.
+	t.Run("self link is passed through unchanged", func(t *testing.T) {
+		got, err := tags.ExpandTagsTagKeyPurposeDataForTest(
+			map[string]interface{}{"network": selfLink}, testTagKeyResourceData(t), &transport_tpg.Config{})
 		if err != nil {
-			t.Fatalf("error migrating state: %s", err)
+			t.Fatalf("unexpected error: %s", err)
+		}
+		if got["network"] != selfLink {
+			t.Errorf("network: want %q, got %q", selfLink, got["network"])
+		}
+	})
+
+	t.Run("other keys are preserved", func(t *testing.T) {
+		got, err := tags.ExpandTagsTagKeyPurposeDataForTest(
+			map[string]interface{}{"network": selfLink, "other": "value"}, testTagKeyResourceData(t), &transport_tpg.Config{})
+		if err != nil {
+			t.Fatalf("unexpected error: %s", err)
+		}
+		if got["other"] != "value" {
+			t.Errorf("other key was not preserved: %#v", got)
+		}
+	})
+
+	t.Run("short form is canonicalized to the self link", func(t *testing.T) {
+		var requestedPath string
+		config := &transport_tpg.Config{
+			Client: networkLookupClient(t, http.StatusOK, func(path string) { requestedPath = path }),
 		}
 
-		const wantNetwork = "https://www.googleapis.com/compute/v1/projects/my-project/global/networks/123456789"
-		purposeData := actual["purpose_data"].(map[string]interface{})
-		if purposeData["network"] != wantNetwork {
-			t.Errorf("network: want %q, got %v", wantNetwork, purposeData["network"])
+		got, err := tags.ExpandTagsTagKeyPurposeDataForTest(
+			map[string]interface{}{"network": "my-project/vpc-us-west1"}, testTagKeyResourceData(t), config)
+		if err != nil {
+			t.Fatalf("unexpected error: %s", err)
+		}
+		if got["network"] != selfLink {
+			t.Errorf("network: want %q, got %q", selfLink, got["network"])
 		}
 
 		// The project and network name from the short form must be the ones looked up.
@@ -1742,29 +1718,35 @@ func TestTagsTagKeyStateUpgradeV0(t *testing.T) {
 		}
 	})
 
-	t.Run("failed lookup leaves the short form untouched", func(t *testing.T) {
-		const shortForm = "my-project/vpc-us-west1"
-		rawState := map[string]interface{}{
-			"purpose_data": map[string]interface{}{"network": shortForm},
-		}
+	t.Run("unresolvable short form is an error", func(t *testing.T) {
+		config := &transport_tpg.Config{Client: networkLookupClient(t, http.StatusNotFound, nil)}
 
-		actual, err := tags.ResourceTagsTagKeyUpgradeV0(
-			context.Background(),
-			rawState,
-			&transport_tpg.Config{Client: networkLookupClient(t, http.StatusNotFound, nil)},
-		)
-		if err != nil {
-			t.Fatalf("a failed lookup must not fail the upgrade, got: %s", err)
+		// A create/update failing loudly is correct: the user can act on it.
+		if _, err := tags.ExpandTagsTagKeyPurposeDataForTest(
+			map[string]interface{}{"network": "my-project/vpc-us-west1"}, testTagKeyResourceData(t), config); err == nil {
+			t.Fatal("expected an error when the network cannot be resolved, got none")
 		}
-		if got := actual["purpose_data"].(map[string]interface{})["network"]; got != shortForm {
-			t.Errorf("network: want %q to be left unchanged, got %v", shortForm, got)
+	})
+
+	t.Run("malformed value is an error", func(t *testing.T) {
+		if _, err := tags.ExpandTagsTagKeyPurposeDataForTest(
+			map[string]interface{}{"network": "not-a-self-link-or-short-form"}, testTagKeyResourceData(t),
+			&transport_tpg.Config{}); err == nil {
+			t.Fatal("expected an error for a malformed network value, got none")
 		}
 	})
 }
 
-// networkLookupClient returns an http.Client that answers the Compute networks GET issued by the
-// upgrader, so the short-form path can be tested without binding a local port. A non-200 status
-// makes the request fail, exercising the graceful-degradation path.
+// roundTripperFunc adapts a function into an http.RoundTripper so the short-form canonicalization
+// path can be exercised without binding a local port.
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+// networkLookupClient answers the Compute networks GET issued by the purpose_data expander. A
+// non-200 status makes the request fail, exercising the error path.
 func networkLookupClient(t *testing.T, status int, onRequest func(path string)) *http.Client {
 	t.Helper()
 	return &http.Client{
@@ -1786,10 +1768,9 @@ func networkLookupClient(t *testing.T, status int, onRequest func(path string)) 
 	}
 }
 
-// roundTripperFunc adapts a function into an http.RoundTripper so the short-form upgrade path can be
-// exercised without binding a local port.
-type roundTripperFunc func(*http.Request) (*http.Response, error)
-
-func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) {
-	return f(r)
+// testTagKeyResourceData builds a ResourceData for the tag key resource, which the expander needs to
+// derive a user agent.
+func testTagKeyResourceData(t *testing.T) *schema.ResourceData {
+	t.Helper()
+	return schema.TestResourceDataRaw(t, tags.ResourceTagsTagKey().Schema, nil)
 }

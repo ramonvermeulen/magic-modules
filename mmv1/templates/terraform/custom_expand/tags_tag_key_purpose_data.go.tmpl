@@ -1,0 +1,71 @@
+{{/*
+	The license inside this block applies to this file
+	Copyright 2026 Google Inc.
+	Licensed under the Apache License, Version 2.0 (the "License");
+	you may not use this file except in compliance with the License.
+	You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+	Unless required by applicable law or agreed to in writing, software
+	distributed under the License is distributed on an "AS IS" BASIS,
+	WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+	See the License for the specific language governing permissions and
+	limitations under the License.
+*/ -}}
+func expand{{$.GetPrefix}}{{$.TitlelizeProperty}}(v interface{}, d tpgresource.TerraformResourceData, config *transport_tpg.Config) (interface{}, error) {
+	if v == nil {
+		return map[string]string{}, nil
+	}
+	m := make(map[string]string)
+	for k, val := range v.(map[string]interface{}) {
+		m[k] = val.(string)
+	}
+
+	// `network` is always sent to the API as a Compute network self link containing the numeric
+	// network id, which is the form the API returns. Canonicalizing here means a config written in
+	// the shorter "{project}/{network_name}" form converges with what the read stores, instead of
+	// diffing forever against it.
+	network, ok := m["network"]
+	if !ok || network == "" {
+		return m, nil
+	}
+	// Anything that is already a self link is left as-is.
+	if strings.HasPrefix(network, "https://") {
+		return m, nil
+	}
+	parts := strings.Split(network, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return nil, fmt.Errorf("could not interpret purpose_data.network %q; expected either a Compute network self link or the form \"<project>/<network-name>\"", network)
+	}
+	project, name := parts[0], parts[1]
+
+	userAgent, err := tpgresource.GenerateUserAgentString(d, config.UserAgent)
+	if err != nil {
+		return nil, err
+	}
+	url := fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/global/networks/%s", project, name)
+	res, err := transport_tpg.SendRequest(transport_tpg.SendRequestOptions{
+		Config:    config,
+		Method:    "GET",
+		Project:   project,
+		RawURL:    url,
+		UserAgent: userAgent,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("could not resolve purpose_data.network %q to a Compute network self link: %w", network, err)
+	}
+	selfLink, ok := res["selfLink"].(string)
+	if !ok || selfLink == "" {
+		return nil, fmt.Errorf("network %q returned no selfLink", network)
+	}
+	m["network"] = selfLink
+	return m, nil
+}
+
+// ExpandTagsTagKeyPurposeDataForTest exposes the purpose_data expander to tests in the tags_test
+// package so the canonicalization logic can be unit tested.
+func ExpandTagsTagKeyPurposeDataForTest(v interface{}, d tpgresource.TerraformResourceData, config *transport_tpg.Config) (map[string]string, error) {
+	expanded, err := expand{{$.GetPrefix}}{{$.TitlelizeProperty}}(v, d, config)
+	if err != nil {
+		return nil, err
+	}
+	return expanded.(map[string]string), nil
+}
